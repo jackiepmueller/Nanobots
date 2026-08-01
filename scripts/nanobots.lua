@@ -57,17 +57,23 @@ update_settings()
 --- @param player LuaPlayer
 --- @param at_least_one boolean
 --- @return boolean
-local _find_item = function(simple_stack, _, player, at_least_one)
+local _find_item = function(simple_stack, _, player, at_least_one, quality)
     local item, count = simple_stack.name, simple_stack.count
+    quality = quality or simple_stack.quality
     count = at_least_one and 1 or count
     local prototype = prototypes.item[item]
     if prototype.type ~= 'item-with-inventory' then
-        if player.cheat_mode or player.get_item_count(item) >= count then
+        -- The string form of get_item_count/find_item_stack only matches normal quality.
+        -- Without a quality filter the mod consumed a normal item while ghost.revive()
+        -- built the ghost at its own (higher) quality -- a free quality upgrade. It also
+        -- refused to build when the player only had items of the required higher quality.
+        local filter = quality and { name = item, quality = quality } or item
+        if player.cheat_mode or player.get_item_count(filter) >= count then
             return true
         else
             local vehicle = player.vehicle
             local train = vehicle and vehicle.train --- @type LuaTrain
-            return vehicle and ((vehicle.get_item_count(item) >= count) or (train and train.get_item_count(item) >= count))
+            return vehicle and ((vehicle.get_item_count(filter) >= count) or (train and train.get_item_count(filter) >= count))
         end
     end
 end
@@ -235,9 +241,10 @@ end
 --- @param cheat boolean cheat the item
 --- @param at_least_one boolean #return as long as count > 0
 --- @return ItemStackDefinition|nil
-local function get_items_from_inv(entity, item_stack, cheat, at_least_one)
+local function get_items_from_inv(entity, item_stack, cheat, at_least_one, quality)
+    quality = quality or item_stack.quality
     if cheat then
-        return { name = item_stack.name, count = item_stack.count, health = 1 }
+        return { name = item_stack.name, count = item_stack.count, health = 1, quality = quality }
     else
         local sources
         if entity.vehicle and entity.vehicle.train then
@@ -249,15 +256,17 @@ local function get_items_from_inv(entity, item_stack, cheat, at_least_one)
             sources = { entity.character }
         end
 
-        local new_item_stack = { name = item_stack.name, count = 0, health = 1 }
+        local new_item_stack = { name = item_stack.name, count = 0, health = 1, quality = quality }
+        -- Take exactly the quality the ghost will be revived at.
+        local item_filter = quality and { name = item_stack.name, quality = quality } or item_stack.name
 
         local count = item_stack.count
 
         for _, source in pairs(sources) do
             for _, inv in pairs(inv_list) do
                 local inventory = source.get_inventory(inv)
-                if inventory and inventory.valid and inventory.get_item_count(item_stack.name) > 0 then
-                    local stack = inventory.find_item_stack(item_stack.name)
+                if inventory and inventory.valid and inventory.get_item_count(item_filter) > 0 then
+                    local stack = inventory.find_item_stack(item_filter)
                     while stack do
                         local removed = math.min(stack.count, count)
                         new_item_stack.count = new_item_stack.count + removed
@@ -268,7 +277,7 @@ local function get_items_from_inv(entity, item_stack, cheat, at_least_one)
                         if new_item_stack.count == item_stack.count then
                             return new_item_stack
                         end
-                        stack = inventory.find_item_stack(item_stack.name)
+                        stack = inventory.find_item_stack(item_filter)
                     end
                 end
             end
@@ -276,7 +285,8 @@ local function get_items_from_inv(entity, item_stack, cheat, at_least_one)
         -- If we havn't returned here check the hand!
         if entity.is_player() then
             local stack = entity.cursor_stack
-            if stack and stack.valid_for_read and stack.name == item_stack.name then
+            if stack and stack.valid_for_read and stack.name == item_stack.name
+                and ((not quality) or (stack.quality and stack.quality.name == quality)) then
                 local removed = math.min(stack.count, count)
                 new_item_stack.count = new_item_stack.count + removed
                 new_item_stack.health = new_item_stack.health * stack.health
@@ -568,7 +578,6 @@ function Queue.item_requests(data)
 
     create_projectile('nano-projectile-constructors', proxy.surface, proxy.force, player.character.position, proxy.position)
     local item_stack = data.item_stack
-    local requests = proxy.item_requests
     local inserted = target.insert(item_stack)
     item_stack.count = item_stack.count - inserted
 
@@ -576,15 +585,28 @@ function Queue.item_requests(data)
         insert_or_spill_items(player, { item_stack })
     end
 
-    requests[item_stack.name] = requests[item_stack.name] - inserted
-    for k, count in pairs(requests) do
-        if count == 0 then
-            requests[k] = nil
+    -- item_requests is read-only in 2.0, so deduct the delivered items from insert_plan,
+    -- removing exactly as many slots as were actually inserted for this name+quality pair.
+    local new_plan = {}
+    local left = inserted
+    for _, plan in pairs(proxy.insert_plan) do
+        local same = plan.id.name == item_stack.name and plan.id.quality == item_stack.quality
+        local slots = (plan.items and plan.items.in_inventory) or {}
+        if same and left > 0 then
+            local keep = {}
+            for i = 1, #slots do
+                if left > 0 then left = left - 1 else keep[#keep + 1] = slots[i] end
+            end
+            if #keep > 0 then
+                new_plan[#new_plan + 1] = { id = plan.id, items = { in_inventory = keep } }
+            end
+        else
+            new_plan[#new_plan + 1] = plan
         end
     end
 
-    if table_size(requests) > 0 then
-        proxy.item_requests = requests
+    if #new_plan > 0 then
+        proxy.insert_plan = new_plan
     else
         proxy.destroy()
     end
@@ -659,10 +681,11 @@ local function queue_ghosts_in_range(player, pos, nano_ammo)
                                             ammo_drain(player, nano_ammo, 1)
                                         end
                                     else
-                                        local item_stack = table_find(prototype.items_to_place_this, _find_item, player)
+                                        local gq = ghost.quality and ghost.quality.name
+                                        local item_stack = table_find(prototype.items_to_place_this, _find_item, player, nil, gq)
                                         if item_stack then
                                             data.action = 'upgrade_ghost'
-                                            local place_item = get_items_from_inv(player, item_stack, player.cheat_mode)
+                                            local place_item = get_items_from_inv(player, item_stack, player.cheat_mode, nil, gq)
                                             if place_item then
                                                 data.entity_name = prototype.name
                                                 data.item_stack = place_item
@@ -675,10 +698,11 @@ local function queue_ghosts_in_range(player, pos, nano_ammo)
                             elseif ghost.name == 'entity-ghost' or (ghost.name == 'tile-ghost' and cfg.build_tiles) then
                                 -- get first available item that places entity from inventory that is not in our hand.
                                 local proto = ghost.ghost_prototype
-                                local item_stack = table_find(proto.items_to_place_this, _find_item, player)
+                                local gq = ghost.quality and ghost.quality.name
+                                local item_stack = table_find(proto.items_to_place_this, _find_item, player, nil, gq)
                                 if item_stack then
                                     if ghost.name == 'entity-ghost' then
-                                        local place_item = get_items_from_inv(player, item_stack, player.cheat_mode)
+                                        local place_item = get_items_from_inv(player, item_stack, player.cheat_mode, nil, gq)
                                         if place_item then
                                             data.action = 'build_entity_ghost'
                                             data.entity_name = proto.name
@@ -717,9 +741,20 @@ local function queue_ghosts_in_range(player, pos, nano_ammo)
                                     ammo_drain(player, nano_ammo, 1)
                                 end -- repair
                             elseif ghost.name == 'item-request-proxy' and cfg.do_proxies then
+                                -- In Factorio 2.0 item_requests is a legacy field: read-only and
+                                -- without quality. Reading it as a name->count dictionary yields
+                                -- name=1 / count=table, so this path was broken entirely.
+                                -- The 2.0 API is insert_plan: {id={name,quality}, items={in_inventory}}.
                                 local items = {}
-                                for item, count in pairs(ghost.item_requests) do
-                                    items[#items + 1] = { name = item, count = count }
+                                for _, plan in pairs(ghost.insert_plan) do
+                                    local n = 0
+                                    if plan.items then
+                                        n = n + (plan.items.in_inventory and #plan.items.in_inventory or 0)
+                                        n = n + (plan.items.grid_count or 0)
+                                    end
+                                    if n > 0 then
+                                        items[#items + 1] = { name = plan.id.name, count = n, quality = plan.id.quality }
+                                    end
                                 end
                                 local item_stack = table_find(items, _find_item, player, true)
                                 if item_stack then
