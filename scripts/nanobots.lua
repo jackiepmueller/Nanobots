@@ -182,10 +182,15 @@ local function insert_or_spill_items(entity, item_stacks, is_return_cheat)
         end
         for _, stack in pairs(new_stacks) do
             local name, count, health = stack.name, stack.count, stack.health or 1
+            -- QUALITY FIX: keep the quality when handing items back, otherwise a failed
+            -- placement silently downgrades a legendary item to a normal one.
+            local quality = stack.quality
             if prototypes.item[name] and not prototypes.item[name].hidden then
-                local inserted = entity.insert({ name = name, count = count, health = health })
+                local inserted = entity.insert({ name = name, count = count, health = health, quality = quality })
                 if inserted ~= count then
-                    entity.surface.spill_item_stack(entity.position, { name = name, count = count - inserted, health = health }, true)
+                    entity.surface.spill_item_stack{ position = entity.position,
+                        stack = { name = name, count = count - inserted, health = health, quality = quality },
+                        enable_looted = true }
                 end
             end
         end
@@ -207,7 +212,9 @@ local function insert_into_entity(entity, item_stacks)
         local name, count, health = stack.name, stack.count, stack.health or 1
         local inserted = entity.insert(stack)
         if inserted ~= count then
-            new_stacks[#new_stacks + 1] = { name = name, count = count - inserted, health = health }
+            -- QUALITY FIX: carry quality into the leftover stack
+            new_stacks[#new_stacks + 1] = { name = name, count = count - inserted, health = health,
+                                            quality = stack.quality }
         end
     end
     return new_stacks
@@ -221,7 +228,9 @@ local function get_all_items_on_ground(entity, existing_stacks)
     local surface, position, bouding_box = entity.surface, entity.position, entity.ghost_prototype.selection_box
     local area = Area.offset(bouding_box, position)
     for _, item_on_ground in pairs(surface.find_entities_filtered { name = 'item-on-ground', area = area }) do
-        item_stacks[#item_stacks + 1] = { name = item_on_ground.stack.name, count = item_on_ground.stack.count, health = item_on_ground.health or 1 }
+        -- QUALITY FIX: items lying under a ghost keep their quality
+        item_stacks[#item_stacks + 1] = { name = item_on_ground.stack.name, count = item_on_ground.stack.count,
+            health = item_on_ground.health or 1, quality = item_on_ground.stack.quality.name }
         item_on_ground.destroy()
     end
     local inserter_area = Area.expand(area, 3)
@@ -540,13 +549,23 @@ function Queue.upgrade_ghost(data)
         return insert_or_spill_items(player, { data.item_stack })
     end
 
+    -- PLACEMENT FIX: verify before creating, so a blocked upgrade returns the item
+    -- instead of relying on create_entity failing.
+    local upgrade_name = data.entity_name or data.item_stack.name
+    if not surface.can_place_entity {
+        name = upgrade_name, position = position, direction = ghost.direction,
+        force = ghost.force, build_check_type = defines.build_check_type.manual } then
+        return insert_or_spill_items(player, { data.item_stack })
+    end
+
     local entity = surface.create_entity {
-        name = data.entity_name or data.item_stack.name,
+        name = upgrade_name,
         direction = ghost.direction,
         force = ghost.force,
         position = position,
         fast_replace = true,
         player = player,
+        quality = data.item_stack.quality,
         type = ghost.type == 'underground-belt' and ghost.belt_to_ground_type or nil,
         raise_built = true
     }
@@ -702,7 +721,14 @@ local function queue_ghosts_in_range(player, pos, nano_ammo)
                                 local item_stack = table_find(proto.items_to_place_this, _find_item, player, nil, gq)
                                 if item_stack then
                                     if ghost.name == 'entity-ghost' then
-                                        local place_item = get_items_from_inv(player, item_stack, player.cheat_mode, nil, gq)
+                                        -- PLACEMENT FIX: verify placement BEFORE consuming anything.
+                                        -- The old code took the item and drained ammo here, and only
+                                        -- checked can_place_entity later in Queue.build_entity_ghost:
+                                        -- the item was handed back, the ammo was not. Same check as there.
+                                        local place_item = ghost.surface.can_place_entity {
+                                            name = ghost.ghost_name, position = ghost.position,
+                                            direction = ghost.direction, force = ghost.force }
+                                            and get_items_from_inv(player, item_stack, player.cheat_mode, nil, gq)
                                         if place_item then
                                             data.action = 'build_entity_ghost'
                                             data.entity_name = proto.name

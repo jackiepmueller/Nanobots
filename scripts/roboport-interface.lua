@@ -13,15 +13,19 @@ local params_to_check = {
     ['nano-signal-chop-trees'] = {
         action = 'mark_items_or_trees',
         find_type = 'tree',
-        item_name = 'raw-wood'
+        -- 2.0 FIX: the item is 'wood' now; 'raw-wood' has not existed since 0.17,
+        -- so the "only chop when wood in network is below N" limit never found anything.
+        item_name = 'wood'
     },
     ['nano-signal-item-on-ground'] = {
         action = 'mark_items_or_trees',
         find_type = 'item-entity'
     },
-    ['nano-tile'] = {
-        action = 'tile_ground'
-    },
+    -- 2.0 FIX: 'tile_ground' has no handler anywhere in the mod, so this signal queued
+    -- work that Queue.execute silently dropped. Disabled until it is actually implemented.
+    -- ['nano-tile'] = {
+    --     action = 'tile_ground'
+    -- },
     ['nano-signal-deconstruct-finished-miners'] = {
         action = 'deconstruct_finished_miners',
         find_type = 'mining-drill'
@@ -95,7 +99,16 @@ Queue.mark_items_or_trees =
             local available_bots = floor(data.logistic_cell.logistic_network.available_construction_robots - (data.logistic_cell.logistic_network.all_construction_robots * (config['nanobots-free-bots-per'].value / 100)))
             local limit = -99999999999
             if data.value < 0 and data.item_name then
-                limit = (data.logistic_cell.logistic_network.get_contents()[data.item_name] or 0) + data.value
+                -- 2.0 FIX: get_contents() returns an array of {name, quality, count},
+                -- not a name -> count dictionary. Indexing it by name always gave nil,
+                -- so the limit was never applied. Sum every quality of the item.
+                local in_network = 0
+                for _, entry in pairs(data.logistic_cell.logistic_network.get_contents()) do
+                    if type(entry) == 'table' then
+                        if entry.name == data.item_name then in_network = in_network + (entry.count or 0) end
+                    end
+                end
+                limit = in_network + data.value
             end
 
             for _, item in pairs(surface.find_entities_filtered(filter)) do
